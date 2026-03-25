@@ -1,0 +1,765 @@
+#!/bin/bash
+
+# wlog - Wrapper para monitoreo y logging de ejecución de scripts
+# Versión: 2.2.1
+# Autor: TEST <test@test.com>
+# Licencia: GPL v3
+# 
+# Uso: wlog [opciones] script [argumentos...]
+#
+# Opciones:
+#   -s, --stdout    Capturar la salida estándar (stdout)
+#   -n, --no-stdout No capturar la salida estándar (por defecto)
+#   -f, --follow    Seguir y monitorear subprocesos (nuevo)
+#   -d, --debug     Modo de depuración para ver mensajes de diagnóstico
+#   -h, --help      Mostrar esta ayuda
+
+# Valores por defecto
+CAPTURE_STDOUT=false
+FOLLOW_SUBPROCESSES=false
+DEBUG_MODE=false
+SCRIPT_TO_RUN=""
+
+# Variables para tracking
+LOG_FILE="/var/log/script_monitor.log"
+DEBUG_LOG="/tmp/wlog_debug.log"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+HOSTNAME=$(hostname)
+USERNAME=$(whoami)
+TRANSACTION_ID=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
+START_TIME=0
+TEMP_STDERR=""
+TEMP_STDOUT=""
+STARTED=false
+PGID=""
+SCRIPT_PID=""
+MONITOR_PID=""
+KNOWN_PIDS=""
+
+# Archivo temporal para compartir información entre procesos
+SUBPROCESS_DATAFILE=$(mktemp)
+# Inicializar archivo de datos de subprocesos
+echo "0" > "$SUBPROCESS_DATAFILE"  # Primer línea: contador
+echo "" >> "$SUBPROCESS_DATAFILE"   # Segunda línea: lista de PIDs
+
+# Función para mapear estado del proceso
+map_process_state() {
+    local STATE_CODE="$1"
+    case "$STATE_CODE" in
+        "R") echo "Running" ;;
+        "S") echo "Sleeping" ;;
+        "D") echo "Uninterruptible_Sleep" ;;
+        "Z") echo "Zombie" ;;
+        "T") echo "Stopped" ;;
+        "I") echo "Idle" ;;
+        *) echo "$STATE_CODE" ;;
+    esac
+}
+
+# Función para escapar correctamente texto para JSON usando solo bash
+escape_for_json() {
+    local input="$1"
+    # Escapar caracteres problemáticos para JSON
+    echo "$input" | sed 's/\\/\\\\/g' | \
+                   sed 's/"/\\"/g' | \
+                   sed 's/\t/\\t/g' | \
+                   sed 's/\r/\\r/g' | \
+                   tr -cd '[:print:]\n' | \
+                   tr '\n' ' ' | \
+                   sed 's/  */ /g' | \
+                   sed 's/^ *//; s/ *$//'
+}
+
+# Función para depuración
+debug_log() {
+    if $DEBUG_MODE; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [DEBUG] $1" >> "$DEBUG_LOG"
+    fi
+}
+
+# Función para manejar la salida limpia
+cleanup() {
+    debug_log "Ejecutando cleanup"
+    
+    # Detener el monitor de procesos si está activo
+    if [ ! -z "$MONITOR_PID" ] && kill -0 $MONITOR_PID 2>/dev/null; then
+        debug_log "Deteniendo monitor de procesos (PID: $MONITOR_PID)"
+        kill $MONITOR_PID 2>/dev/null
+    fi
+
+    # Eliminar archivos temporales si existen
+    [ -f "$TEMP_STDERR" ] && rm -f "$TEMP_STDERR"
+    [ -f "$TEMP_STDOUT" ] && rm -f "$TEMP_STDOUT"
+    [ -f "$SUBPROCESS_DATAFILE" ] && rm -f "$SUBPROCESS_DATAFILE"
+    
+    # Si estamos siguiendo subprocesos, asegurarnos de que todos se detengan
+    if $FOLLOW_SUBPROCESSES && [ ! -z "$PGID" ]; then
+        debug_log "Terminando grupo de procesos $PGID"
+        # Intentar terminar limpiamente todos los procesos en el grupo
+        pkill -TERM -g $PGID 2>/dev/null
+        sleep 0.5
+        # Si alguno sigue ejecutándose, forzar su terminación
+        pkill -KILL -g $PGID 2>/dev/null
+    fi
+}
+
+# Función para obtener solo los hijos directos de un PID (primer nivel)
+get_direct_child_pids() {
+    local PARENT=$1
+    local CHILDREN=""
+    
+    # Obtener solo los hijos directos
+    CHILDREN=$(ps -o pid= --ppid $PARENT 2>/dev/null | tr -d ' ' | tr '\n' ' ')
+    
+    echo "$CHILDREN"
+}
+
+# Función para actualizar el contador y lista de subprocesos
+update_subprocess_data() {
+    local PID=$1
+    
+    # Leer valores actuales del archivo
+    local CURRENT_COUNT=$(head -n 1 "$SUBPROCESS_DATAFILE")
+    local CURRENT_LIST=$(tail -n 1 "$SUBPROCESS_DATAFILE")
+    
+    # Actualizar contador
+    CURRENT_COUNT=$((CURRENT_COUNT + 1))
+    
+    # Actualizar lista de PIDs
+    if [ -z "$CURRENT_LIST" ]; then
+        CURRENT_LIST="$PID"
+    else
+        CURRENT_LIST="$CURRENT_LIST,$PID"
+    fi
+    
+    # Escribir valores actualizados al archivo
+    echo "$CURRENT_COUNT" > "$SUBPROCESS_DATAFILE"
+    echo "$CURRENT_LIST" >> "$SUBPROCESS_DATAFILE"
+    
+    debug_log "Archivo de datos actualizado: count=$CURRENT_COUNT, pids=$CURRENT_LIST"
+}
+
+# Función para registrar un nuevo proceso encontrado
+log_subprocess() {
+    local PID=$1
+    local PARENT_PID=$2
+    local CMD=$3
+    local PROC_TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    debug_log "Registrando subproceso: PID=$PID PPID=$PARENT_PID CMD=$CMD"
+    
+    # Validar que PID no esté vacío
+    if [ -z "$PID" ]; then
+        debug_log "ERROR: PID vacío, omitiendo registro"
+        return 1
+    fi
+    
+    # Validar y asignar valores por defecto para campos numéricos
+    if [ -z "$PARENT_PID" ]; then PARENT_PID="0"; fi
+    if [ -z "$PGID" ]; then PGID="0"; fi
+    
+    # Actualizar archivo de datos compartido
+    update_subprocess_data "$PID"
+    
+    # Obtener información adicional del proceso
+    local CPU_USAGE=$(ps -p $PID -o %cpu= 2>/dev/null | tr -d ' ')
+    if [ -z "$CPU_USAGE" ]; then CPU_USAGE="0.0"; fi
+    
+    local MEM_USAGE=$(ps -p $PID -o %mem= 2>/dev/null | tr -d ' ')
+    if [ -z "$MEM_USAGE" ]; then MEM_USAGE="0.0"; fi
+    
+    local STATE_CODE=$(ps -p $PID -o state= 2>/dev/null | tr -d ' ')
+    if [ -z "$STATE_CODE" ]; then STATE_CODE="?"; fi
+    local STATE=$(map_process_state "$STATE_CODE")
+    
+    # Escapar caracteres problemáticos en el comando
+    CMD=$(escape_for_json "$CMD")
+    
+    # Registrar detección de subproceso en formato JSON
+    local SUBPROCESS_JSON="{\"timestamp\":\"$PROC_TIMESTAMP\",\"type\":\"subprocess_detected\",\"txid\":\"$TRANSACTION_ID\",\"script\":\"$SCRIPT_TO_RUN\",\"pid\":$PID,\"parent_pid\":$PARENT_PID,\"pgid\":$PGID,\"command\":\"$CMD\",\"state\":\"$STATE\",\"cpu\":$CPU_USAGE,\"mem\":$MEM_USAGE}"
+    
+    debug_log "Escribiendo JSON de subproceso al log: $SUBPROCESS_JSON"
+    echo "$SUBPROCESS_JSON" >> "$LOG_FILE"
+}
+
+# Función para monitorear procesos en tiempo real solo de primer nivel
+monitor_processes() {
+    debug_log "Iniciando monitor de procesos (PID: $$)"
+    debug_log "Script principal PID: $SCRIPT_PID"
+    
+    # Inicializar lista de PIDs conocidos con el proceso principal
+    KNOWN_PIDS="$SCRIPT_PID $MONITOR_PID"
+    debug_log "PIDs conocidos inicializados: $KNOWN_PIDS"
+    
+    # Número de ciclos para depuración
+    local CYCLES=0
+    
+    while true; do
+        ((CYCLES++))
+        debug_log "Ciclo de monitoreo #$CYCLES"
+        
+        # Verificar si el proceso principal sigue ejecutándose
+        if ! kill -0 $SCRIPT_PID 2>/dev/null; then
+            debug_log "Proceso principal $SCRIPT_PID ya no existe, finalizando monitor"
+            break
+        fi
+        
+        # Obtener solo los hijos directos del script principal (primer nivel)
+        local DIRECT_CHILDREN=$(get_direct_child_pids $SCRIPT_PID)
+        debug_log "Hijos directos encontrados del PID $SCRIPT_PID: $DIRECT_CHILDREN"
+        
+        # Comprobar si hay nuevos PIDs
+        for pid in $DIRECT_CHILDREN; do
+            debug_log "Analizando hijo directo PID: $pid"
+            
+            # Omitir nuestro propio proceso de monitoreo
+            if [ "$pid" = "$MONITOR_PID" ]; then
+                debug_log "PID $pid es el monitor, ignorando"
+                continue
+            fi
+            
+            # Comprobar si el PID ya es conocido
+            if [[ ! "$KNOWN_PIDS" =~ (^|[[:space:]])$pid($|[[:space:]]) ]]; then
+                debug_log "PID $pid no está en lista de conocidos: $KNOWN_PIDS"
+                
+                # Obtener información del proceso
+                local PARENT_PID=$(ps -p $pid -o ppid= 2>/dev/null | tr -d ' ')
+                local CMD=$(ps -p $pid -o cmd= 2>/dev/null)
+                
+                debug_log "Información obtenida - PPID: $PARENT_PID, CMD: $CMD"
+                
+                # Registrar el subproceso en el log
+                log_subprocess $pid $PARENT_PID "$CMD"
+                
+                # Añadir a la lista de PIDs conocidos
+                KNOWN_PIDS="$KNOWN_PIDS $pid"
+                debug_log "Lista actualizada de PIDs conocidos: $KNOWN_PIDS"
+            else
+                debug_log "PID $pid ya es conocido, ignorando"
+            fi
+        done
+        
+        debug_log "Esperando 1 segundo antes del siguiente ciclo"
+        sleep 1
+    done
+    
+    debug_log "Monitor de procesos finalizado"
+}
+
+# Función para leer datos de subprocesos desde el archivo temporal
+read_subprocess_data() {
+    local SUBPROCESS_COUNT=$(head -n 1 "$SUBPROCESS_DATAFILE")
+    local SUBPROCESS_PIDS=$(tail -n 1 "$SUBPROCESS_DATAFILE")
+    
+    debug_log "Leyendo datos de subprocesos: count=$SUBPROCESS_COUNT, pids=$SUBPROCESS_PIDS"
+    
+    echo "$SUBPROCESS_COUNT|$SUBPROCESS_PIDS"
+}
+
+# Función para registrar la interrupción
+handle_exit() {
+    local EXIT_TYPE=$1
+    local EXIT_CODE=$2
+    
+    debug_log "Ejecutando handle_exit: tipo=$EXIT_TYPE, código=$EXIT_CODE"
+    
+    # Solo registrar la interrupción si ya habíamos comenzado la ejecución
+    if $STARTED; then
+        local END_TIME=$(date +%s.%N)
+        local END_TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+        local EXECUTION_TIME=0
+        
+        # Calcular tiempo de ejecución
+        if [ $START_TIME != 0 ]; then
+            EXECUTION_TIME=$(echo "$END_TIME - $START_TIME" | bc | sed 's/^\./0./' )
+        fi
+        
+        # Validar que EXECUTION_TIME no esté vacío
+        if [ -z "$EXECUTION_TIME" ]; then EXECUTION_TIME="0.0"; fi
+        
+        debug_log "Tiempo de ejecución inicial: $EXECUTION_TIME segundos"
+        
+        # Validar EXIT_CODE
+        if [ -z "$EXIT_CODE" ]; then EXIT_CODE="255"; fi
+        
+        # Leer stderr si existe
+        local STDERR_MSG=""
+        if [ -f "$TEMP_STDERR" ] && [ -s "$TEMP_STDERR" ]; then
+            STDERR_MSG=$(escape_for_json "$(cat "$TEMP_STDERR")")
+        fi
+        
+        # Leer stdout si se capturó
+        local STDOUT_MSG=""
+        if $CAPTURE_STDOUT && [ -f "$TEMP_STDOUT" ] && [ -s "$TEMP_STDOUT" ]; then
+            STDOUT_MSG=$(escape_for_json "$(cat "$TEMP_STDOUT")")
+        fi
+        
+        # Obtener información de recursos de subprocesos 
+        local SUBPROC_INFO=""
+        if $FOLLOW_SUBPROCESSES; then
+            debug_log "Recopilando información final de subprocesos"
+            
+            # Si usamos -f, siempre restar el segundo de espera del monitor
+            if [ $START_TIME != 0 ]; then
+                EXECUTION_TIME=$(echo "$EXECUTION_TIME - 1" | bc | sed 's/^\./0./')
+                debug_log "Tiempo ajustado restando 1s por monitoreo con opción -f: $EXECUTION_TIME"
+            fi
+            
+            # Validar EXECUTION_TIME después del ajuste
+            if [ -z "$EXECUTION_TIME" ]; then EXECUTION_TIME="0.0"; fi
+            
+            # Leer datos de subprocesos desde el archivo compartido
+            local SUBPROCESS_DATA=$(read_subprocess_data)
+            local SUBPROCESS_COUNT=$(echo "$SUBPROCESS_DATA" | cut -d'|' -f1)
+            local SUBPROCESS_PIDS=$(echo "$SUBPROCESS_DATA" | cut -d'|' -f2)
+            
+            debug_log "Datos leídos: count=$SUBPROCESS_COUNT, pids=$SUBPROCESS_PIDS"
+            
+            # Validar SUBPROCESS_COUNT
+            if [ -z "$SUBPROCESS_COUNT" ]; then SUBPROCESS_COUNT="0"; fi
+            
+            # Verificar si se detectaron subprocesos
+            if [ "$SUBPROCESS_COUNT" -gt 0 ]; then
+                SUBPROC_INFO=",\"has_subprocesses\":true,\"subprocess_count\":$SUBPROCESS_COUNT,\"subprocess_pids\":\"$SUBPROCESS_PIDS\""
+                
+                # Intentar obtener uso total de CPU y memoria de los subprocesos que aún existan
+                if command -v ps &>/dev/null; then
+                    local CPU_USAGE=0
+                    local MEM_USAGE=0
+                    local ACTIVE_COUNT=0
+                    
+                    for pid in $(echo "$SUBPROCESS_PIDS" | tr ',' ' '); do
+                        # Verificar si el proceso sigue vivo
+                        if kill -0 $pid 2>/dev/null; then
+                            local PID_CPU=$(ps --no-headers -p $pid -o %cpu 2>/dev/null | tr -d ' ')
+                            local PID_MEM=$(ps --no-headers -p $pid -o %mem 2>/dev/null | tr -d ' ')
+                            
+                            if [ ! -z "$PID_CPU" ] && [ ! -z "$PID_MEM" ]; then
+                                CPU_USAGE=$(echo "$CPU_USAGE + $PID_CPU" | bc)
+                                MEM_USAGE=$(echo "$MEM_USAGE + $PID_MEM" | bc)
+                                ((ACTIVE_COUNT++))
+                            fi
+                        else
+                            debug_log "PID $pid ya no existe al recopilar métricas"
+                        fi
+                    done
+                    
+                    if [ $ACTIVE_COUNT -gt 0 ]; then
+                        # Validar valores antes de incluir en JSON
+                        if [ -z "$CPU_USAGE" ]; then CPU_USAGE="0.0"; fi
+                        if [ -z "$MEM_USAGE" ]; then MEM_USAGE="0.0"; fi
+                        
+                        SUBPROC_INFO="$SUBPROC_INFO,\"active_subprocs\":$ACTIVE_COUNT,\"subproc_cpu_usage\":$CPU_USAGE,\"subproc_mem_usage\":$MEM_USAGE"
+                        debug_log "Uso de recursos calculado - CPU: $CPU_USAGE, MEM: $MEM_USAGE (de $ACTIVE_COUNT procesos activos)"
+                    else
+                        SUBPROC_INFO="$SUBPROC_INFO,\"active_subprocs\":0"
+                        debug_log "No hay subprocesos activos en este momento"
+                    fi
+                    
+                    # Recopilar información resumida de los estados de los subprocesos activos
+                    local PROCS_BY_STATE=""
+                    for pid in $(echo "$SUBPROCESS_PIDS" | tr ',' ' '); do
+                        if kill -0 $pid 2>/dev/null; then
+                            local STATE_CODE=$(ps -p $pid -o state= 2>/dev/null | tr -d ' ')
+                            if [ ! -z "$STATE_CODE" ]; then
+                                local STATE=$(map_process_state "$STATE_CODE")
+                                PROCS_BY_STATE="$PROCS_BY_STATE$STATE,"
+                            fi
+                        fi
+                    done
+                    
+                    if [ ! -z "$PROCS_BY_STATE" ]; then
+                        PROCS_BY_STATE=${PROCS_BY_STATE%,}  # Eliminar última coma
+                        SUBPROC_INFO="$SUBPROC_INFO,\"subproc_states\":\"$PROCS_BY_STATE\""
+                        debug_log "Estados de procesos: $PROCS_BY_STATE"
+                    fi
+                fi
+            else
+                # No se encontraron subprocesos en ningún momento
+                SUBPROC_INFO=",\"has_subprocesses\":false"
+                debug_log "No se detectaron subprocesos durante la ejecución"
+            fi
+        fi
+        
+        # Construir el mensaje JSON según el tipo de salida
+        local END_JSON=""
+        if [ "$EXIT_TYPE" = "INTERRUPTED" ]; then
+            if $CAPTURE_STDOUT; then
+                END_JSON="{\"timestamp\":\"$END_TIMESTAMP\",\"type\":\"end\",\"txid\":\"$TRANSACTION_ID\",\"host\":\"$HOSTNAME\",\"script\":\"$SCRIPT_TO_RUN\",\"args\":\"$SCRIPT_ARGS_JSON\",\"command\":\"$FULL_COMMAND_JSON\",\"user\":\"$USERNAME\",\"origin\":\"$ORIGIN\",\"capture_stdout\":$CAPTURE_STDOUT,\"follow_subprocesses\":$FOLLOW_SUBPROCESSES,\"result\":\"$EXIT_TYPE\",\"exit_code\":$EXIT_CODE,\"time\":${EXECUTION_TIME},\"stdout\":\"$STDOUT_MSG\",\"stderr\":\"$STDERR_MSG\"$SUBPROC_INFO}"
+            else
+                END_JSON="{\"timestamp\":\"$END_TIMESTAMP\",\"type\":\"end\",\"txid\":\"$TRANSACTION_ID\",\"host\":\"$HOSTNAME\",\"script\":\"$SCRIPT_TO_RUN\",\"args\":\"$SCRIPT_ARGS_JSON\",\"command\":\"$FULL_COMMAND_JSON\",\"user\":\"$USERNAME\",\"origin\":\"$ORIGIN\",\"capture_stdout\":$CAPTURE_STDOUT,\"follow_subprocesses\":$FOLLOW_SUBPROCESSES,\"result\":\"$EXIT_TYPE\",\"exit_code\":$EXIT_CODE,\"time\":${EXECUTION_TIME},\"stderr\":\"$STDERR_MSG\"$SUBPROC_INFO}"
+            fi
+        else
+            if $CAPTURE_STDOUT; then
+                END_JSON="{\"timestamp\":\"$END_TIMESTAMP\",\"type\":\"end\",\"txid\":\"$TRANSACTION_ID\",\"host\":\"$HOSTNAME\",\"script\":\"$SCRIPT_TO_RUN\",\"args\":\"$SCRIPT_ARGS_JSON\",\"command\":\"$FULL_COMMAND_JSON\",\"user\":\"$USERNAME\",\"origin\":\"$ORIGIN\",\"capture_stdout\":$CAPTURE_STDOUT,\"follow_subprocesses\":$FOLLOW_SUBPROCESSES,\"result\":\"$EXIT_TYPE\",\"exit_code\":$EXIT_CODE,\"time\":${EXECUTION_TIME},\"stdout\":\"$STDOUT_MSG\",\"stderr\":\"$STDERR_MSG\"$SUBPROC_INFO}"
+            else
+                END_JSON="{\"timestamp\":\"$END_TIMESTAMP\",\"type\":\"end\",\"txid\":\"$TRANSACTION_ID\",\"host\":\"$HOSTNAME\",\"script\":\"$SCRIPT_TO_RUN\",\"args\":\"$SCRIPT_ARGS_JSON\",\"command\":\"$FULL_COMMAND_JSON\",\"user\":\"$USERNAME\",\"origin\":\"$ORIGIN\",\"capture_stdout\":$CAPTURE_STDOUT,\"follow_subprocesses\":$FOLLOW_SUBPROCESSES,\"result\":\"$EXIT_TYPE\",\"exit_code\":$EXIT_CODE,\"time\":${EXECUTION_TIME},\"stderr\":\"$STDERR_MSG\"$SUBPROC_INFO}"
+            fi
+        fi
+        
+        # Registrar el fin de la ejecución
+        debug_log "Escribiendo JSON de finalización al log: $END_JSON"
+        echo "$END_JSON" >> "$LOG_FILE"
+    fi
+    
+    # Limpiar archivos temporales y procesos
+    cleanup
+    
+    # Si fue una interrupción, salir con el código apropiado
+    if [ "$EXIT_TYPE" = "INTERRUPTED" ]; then
+        debug_log "Saliendo por interrupción con código $EXIT_CODE"
+        exit $EXIT_CODE
+    fi
+}
+
+# Establecer manejadores de señal
+trap 'handle_exit "INTERRUPTED" 130' SIGINT
+trap 'handle_exit "INTERRUPTED" 143' SIGTERM
+trap 'handle_exit "INTERRUPTED" 1' SIGHUP
+trap cleanup EXIT
+
+# Función de ayuda actualizada
+show_help() {
+    echo "wlog - Wrapper para monitoreo y logging de scripts"
+    echo "Versión: 2.2.1"
+    echo "Autor: TEST <test@test.com>"
+    echo "Licencia: GPL v3"
+    echo ""
+    echo "Descripción:"
+    echo "  wlog permite ejecutar cualquier script o programa, registrando automáticamente"
+    echo "  información sobre su ejecución, incluyendo tiempo de inicio, duración,"
+    echo "  resultado, errores y opcionalmente la salida estándar."
+    echo ""
+    echo "  Con la opción -f, también monitorea los subprocesos directos (primer nivel)"
+    echo "  lanzados por el script principal, registrando cada nuevo subproceso detectado"
+    echo "  en tiempo real con el mismo ID de transacción para su seguimiento."
+    echo ""
+    echo "  Toda la información se almacena en formato JSON en /var/log/script_monitor.log,"
+    echo "  permitiendo un monitoreo detallado y análisis posterior de las ejecuciones."
+    echo ""
+    echo "Uso: $0 [opciones] script [argumentos...]"
+    echo ""
+    echo "Opciones:"
+    echo "  -s, --stdout    Capturar la salida estándar (stdout)"
+    echo "  -n, --no-stdout No capturar la salida estándar (por defecto)"
+    echo "  -f, --follow    Seguir y monitorear subprocesos directos"
+    echo "  -d, --debug     Habilitar modo de depuración (crea logs en /tmp/wlog_debug.log)"
+    echo "  -h, --help      Mostrar esta ayuda"
+    echo ""
+    echo "Ejemplos:"
+    echo "  $0 mi_script.sh                      # Ejecuta sin capturar stdout"
+    echo "  $0 --follow mi_script.sh arg1 arg2   # Monitoreando subprocesos"
+    echo "  $0 -s -f -d python3 script.py        # Ejecuta con todas las opciones y depuración"
+    echo ""
+    echo "Cada ejecución genera un ID de transacción único que permite relacionar"
+    echo "los registros de inicio, subprocesos y finalización en el archivo de log."
+    exit 0
+}
+
+# Procesar opciones
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -s|--stdout)
+            CAPTURE_STDOUT=true
+            shift
+            ;;
+        -n|--no-stdout)
+            CAPTURE_STDOUT=false
+            shift
+            ;;
+        -f|--follow)
+            FOLLOW_SUBPROCESSES=true
+            shift
+            ;;
+        -d|--debug)
+            DEBUG_MODE=true
+            shift
+            ;;
+        -h|--help)
+            show_help
+            ;;
+        *)
+            # Si el primer argumento no es una opción, es el script
+            if [ -z "$SCRIPT_TO_RUN" ]; then
+                SCRIPT_TO_RUN="$1"
+                shift
+                break
+            fi
+            ;;
+    esac
+done
+
+# Inicializar el log de depuración si el modo está activado
+if $DEBUG_MODE; then
+    echo "=== Iniciando wlog en modo depuración $(date) ===" > "$DEBUG_LOG"
+    echo "Opciones: stdout=$CAPTURE_STDOUT, follow=$FOLLOW_SUBPROCESSES" >> "$DEBUG_LOG"
+    echo "Script a ejecutar: $SCRIPT_TO_RUN" >> "$DEBUG_LOG"
+    echo "Archivo de datos de subprocesos: $SUBPROCESS_DATAFILE" >> "$DEBUG_LOG"
+    
+    # Verificar permisos de log
+    if [ ! -w "$(dirname "$LOG_FILE")" ]; then
+        echo "ADVERTENCIA: No se tienen permisos de escritura en $(dirname "$LOG_FILE")" >> "$DEBUG_LOG"
+    fi
+fi
+
+# Verificar que se proporcione al menos un argumento
+if [ -z "$SCRIPT_TO_RUN" ]; then
+    echo "Error: Debe especificar un script para ejecutar."
+    echo "Use '$0 --help' para más información."
+    exit 1
+fi
+
+# Variables
+SCRIPT_ARGS="$@"
+# Escapar comillas en los argumentos para JSON
+SCRIPT_ARGS_JSON=$(escape_for_json "$SCRIPT_ARGS")
+# Crear una cadena completa del comando
+FULL_COMMAND="$SCRIPT_TO_RUN $SCRIPT_ARGS"
+FULL_COMMAND_JSON=$(escape_for_json "$FULL_COMMAND")
+
+debug_log "Argumentos: $SCRIPT_ARGS"
+debug_log "Comando completo: $FULL_COMMAND"
+
+# Detectar el origen de la ejecución
+detect_origin() {
+    # Verificar si estamos en un entorno cron
+    if [ "$LOGNAME" = "root" -a -z "$TERM" ] || [ ! -z "$CRON_ENV" ]; then
+        CRON_LINE=""
+        
+        # Primero intentar con crontab -l del usuario actual
+        CRON_LINE=$(crontab -l 2>/dev/null | grep -F "$SCRIPT_TO_RUN" | grep -v '^#' | head -1)
+        
+        # Si no encuentra, buscar con el nombre base del script
+        if [ -z "$CRON_LINE" ]; then
+            SCRIPT_BASE=$(basename "$SCRIPT_TO_RUN")
+            CRON_LINE=$(crontab -l 2>/dev/null | grep -F "$SCRIPT_BASE" | grep -v '^#' | head -1)
+        fi
+        
+        # Si somos root, también buscar en crontab de otros usuarios
+        if [ -z "$CRON_LINE" ] && [ "$USER" = "root" ]; then
+            for user in $(cut -f1 -d: /etc/passwd); do
+                TEMP_LINE=$(crontab -u "$user" -l 2>/dev/null | grep -F "$SCRIPT_TO_RUN" | grep -v '^#' | head -1)
+                if [ ! -z "$TEMP_LINE" ]; then
+                    CRON_LINE="$TEMP_LINE"
+                    break
+                fi
+            done
+        fi
+        
+        # Si aún no encontramos, buscar en archivos del sistema
+        if [ -z "$CRON_LINE" ]; then
+            CRON_FILES="/etc/crontab /etc/cron.d/*"
+            for file in $CRON_FILES; do
+                if [ -f "$file" ] && [ -r "$file" ]; then
+                    TEMP_LINE=$(grep -F "$SCRIPT_TO_RUN" "$file" 2>/dev/null | grep -v '^#' | grep -E '^[[:space:]]*([0-9*,/-]+[[:space:]]+){5}' | head -1)
+                    if [ ! -z "$TEMP_LINE" ]; then
+                        CRON_LINE="$TEMP_LINE"
+                        break
+                    fi
+                fi
+            done
+        fi
+        
+        if [ ! -z "$CRON_LINE" ]; then
+            echo "cron|$CRON_LINE"
+        else
+            echo "cron"
+        fi
+    elif [ ! -z "$INVOCATION_ID" ]; then
+        echo "systemd"
+    elif [ ! -z "$TERM" ] && [ -t 0 ]; then
+        echo "shell"
+    else
+        # Alternativa: revisar el proceso padre
+        PPID_CMD=$(ps -o comm= -p $PPID 2>/dev/null)
+        case "$PPID_CMD" in
+            "systemd"|"init")
+                echo "systemd"
+                ;;
+            "cron"|"crond")
+                echo "cron"
+                ;;
+            *)
+                echo "shell"
+                ;;
+        esac
+    fi
+}
+
+ORIGIN=$(detect_origin)
+debug_log "Origen de ejecución detectado: $ORIGIN"
+
+# Asegurar que el archivo de log existe y tiene permisos correctos
+if [ ! -f "$LOG_FILE" ]; then
+    touch "$LOG_FILE" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        debug_log "ERROR: No se pudo crear el archivo de log $LOG_FILE"
+        echo "ERROR: No se pudo crear el archivo de log $LOG_FILE"
+        exit 1
+    fi
+    chmod 644 "$LOG_FILE" 2>/dev/null
+fi
+
+if [ ! -w "$LOG_FILE" ]; then
+    debug_log "ERROR: No se tienen permisos de escritura en $LOG_FILE"
+    echo "ERROR: No se tienen permisos de escritura en $LOG_FILE"
+    exit 1
+fi
+
+# Registrar inicio de ejecución en formato JSON con el comando completo y argumentos
+START_JSON="{\"timestamp\":\"$TIMESTAMP\",\"type\":\"start\",\"txid\":\"$TRANSACTION_ID\",\"host\":\"$HOSTNAME\",\"script\":\"$SCRIPT_TO_RUN\",\"args\":\"$SCRIPT_ARGS_JSON\",\"command\":\"$FULL_COMMAND_JSON\",\"user\":\"$USERNAME\",\"origin\":\"$ORIGIN\",\"capture_stdout\":$CAPTURE_STDOUT,\"follow_subprocesses\":$FOLLOW_SUBPROCESSES}"
+debug_log "Escribiendo JSON de inicio al log: $START_JSON"
+echo "$START_JSON" >> "$LOG_FILE"
+
+# Marcar que hemos comenzado
+STARTED=true
+
+# Crear archivo temporal para stderr (siempre)
+TEMP_STDERR=$(mktemp)
+debug_log "Archivo temporal para stderr: $TEMP_STDERR"
+
+# Ejecutar el script y capturar el tiempo de ejecución
+START_TIME=$(date +%s.%N)
+debug_log "Iniciando ejecución a las $START_TIME"
+
+if $FOLLOW_SUBPROCESSES; then
+    debug_log "Modo de seguimiento de subprocesos activado"
+    
+    # Crear un nuevo grupo de procesos para el script y sus hijos
+    # setsid crea una nueva sesión y grupo de procesos
+    if $CAPTURE_STDOUT; then
+        debug_log "Capturando stdout"
+        
+        # Capturar tanto stdout como stderr
+        TEMP_STDOUT=$(mktemp)
+        debug_log "Archivo temporal para stdout: $TEMP_STDOUT"
+        
+        # Ejecutar el comando en un nuevo grupo de procesos
+        debug_log "Ejecutando comando con setsid: $SCRIPT_TO_RUN $SCRIPT_ARGS"
+        setsid "$SCRIPT_TO_RUN" $SCRIPT_ARGS > >(tee "$TEMP_STDOUT") 2> >(tee "$TEMP_STDERR" >&2) &
+        SCRIPT_PID=$!
+        debug_log "PID del script: $SCRIPT_PID"
+        
+        # Obtener el PGID después de iniciar el proceso
+        sleep 0.1 # Pequeña pausa para asegurar que el proceso ha iniciado
+        PGID=$(ps -o pgid= -p $SCRIPT_PID 2>/dev/null | tr -d ' ')
+        debug_log "PGID obtenido: $PGID"
+        
+        # Iniciar el monitor de procesos en segundo plano ANTES de wait
+        debug_log "Iniciando monitor de procesos"
+        monitor_processes &
+        MONITOR_PID=$!
+        debug_log "PID del monitor: $MONITOR_PID"
+        
+        # Esperar a que el script termine
+        debug_log "Esperando a que el script termine"
+        wait $SCRIPT_PID
+        EXIT_CODE=$?
+        debug_log "Script terminado con código: $EXIT_CODE"
+
+        # Dar tiempo al monitor para que termine y registre los últimos subprocesos
+        sleep 1
+    else
+        debug_log "No se captura stdout"
+        
+        # Capturar solo stderr
+        debug_log "Ejecutando comando con setsid: $SCRIPT_TO_RUN $SCRIPT_ARGS"
+        setsid "$SCRIPT_TO_RUN" $SCRIPT_ARGS 2>"$TEMP_STDERR" &
+        SCRIPT_PID=$!
+        debug_log "PID del script: $SCRIPT_PID"
+        
+        # Obtener el PGID después de iniciar el proceso
+        sleep 0.1
+        PGID=$(ps -o pgid= -p $SCRIPT_PID 2>/dev/null | tr -d ' ')
+        debug_log "PGID obtenido: $PGID"
+        
+        # Iniciar el monitor de procesos en segundo plano ANTES de wait
+        debug_log "Iniciando monitor de procesos"
+        monitor_processes &
+        MONITOR_PID=$!
+        debug_log "PID del monitor: $MONITOR_PID"
+        
+        # Esperar a que el script termine
+        debug_log "Esperando a que el script termine"
+        wait $SCRIPT_PID
+        EXIT_CODE=$?
+        debug_log "Script terminado con código: $EXIT_CODE"
+
+        # Dar tiempo al monitor para que termine y registre los últimos subprocesos
+        sleep 1
+    fi
+else
+    debug_log "Ejecutando sin seguimiento de subprocesos"
+    
+    # Comportamiento original sin seguimiento de subprocesos
+    if $CAPTURE_STDOUT; then
+        # Capturar tanto stdout como stderr
+        TEMP_STDOUT=$(mktemp)
+        debug_log "Archivo temporal para stdout: $TEMP_STDOUT"
+        
+        debug_log "Ejecutando comando: $SCRIPT_TO_RUN $SCRIPT_ARGS"
+        "$SCRIPT_TO_RUN" $SCRIPT_ARGS > >(tee "$TEMP_STDOUT") 2> >(tee "$TEMP_STDERR" >&2)
+        EXIT_CODE=$?
+        debug_log "Script terminado con código: $EXIT_CODE"
+    else
+        debug_log "Ejecutando comando: $SCRIPT_TO_RUN $SCRIPT_ARGS"
+        "$SCRIPT_TO_RUN" $SCRIPT_ARGS 2>"$TEMP_STDERR"
+        EXIT_CODE=$?
+        debug_log "Script terminado con código: $EXIT_CODE"
+    fi
+fi
+
+END_TIME=$(date +%s.%N)
+debug_log "Ejecución finalizada a las $END_TIME"
+
+# Determinar el estado de resultado
+RESULT_STATUS="OK"
+if [ $EXIT_CODE -ne 0 ]; then
+    RESULT_STATUS="ERROR"
+fi
+debug_log "Estado de resultado: $RESULT_STATUS"
+
+# Una verificación manual de subprocesos como respaldo
+if $FOLLOW_SUBPROCESSES; then
+    debug_log "Realizando verificación final de subprocesos"
+    
+    # Leer los datos actuales
+    SUBPROC_DATA=$(read_subprocess_data)
+    CURRENT_COUNT=$(echo "$SUBPROC_DATA" | cut -d'|' -f1)
+    
+    debug_log "Verificación final: $CURRENT_COUNT subprocesos registrados"
+    
+    # Si es 0, buscar directamente
+    if [ "$CURRENT_COUNT" -eq 0 ]; then
+        debug_log "Realizando búsqueda final de hijos directos"
+        
+        # Buscar hijos directos una última vez
+        DIRECT_CHILDREN=$(get_direct_child_pids $SCRIPT_PID 2>/dev/null)
+        
+        if [ ! -z "$DIRECT_CHILDREN" ]; then
+            debug_log "Encontrados en la verificación final: $DIRECT_CHILDREN"
+            
+            # Registrar cada uno encontrado
+            for pid in $DIRECT_CHILDREN; do
+                # Comprobar si el PID ya es conocido
+                if [[ ! "$KNOWN_PIDS" =~ (^|[[:space:]])$pid($|[[:space:]]) ]]; then
+                    debug_log "Registrando subproceso tardío: $pid"
+                    
+                    # Obtener información del proceso
+                    PARENT_PID=$(ps -p $pid -o ppid= 2>/dev/null | tr -d ' ')
+                    CMD=$(ps -p $pid -o cmd= 2>/dev/null)
+                    
+                    # Registrar el subproceso en el log
+                    log_subprocess $pid $PARENT_PID "$CMD"
+                fi
+            done
+        fi
+    fi
+fi
+
+# Registrar resultado normal (no interrumpido)
+handle_exit "$RESULT_STATUS" $EXIT_CODE
+
+# Retornar el mismo código de salida del script ejecutado
+debug_log "Saliendo con código: $EXIT_CODE"
+exit $EXIT_CODE

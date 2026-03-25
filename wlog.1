@@ -1,0 +1,230 @@
+.TH WLOG 1 "Julio 2025" "wlog 2.2.1" "Comandos de Usuario"
+
+.SH NOMBRE
+wlog \- Wrapper para monitoreo y logging de ejecución de scripts
+
+.SH SINOPSIS
+.B wlog
+[\fIOPCIONES\fR] \fISCRIPT\fR [\fIARGUMENTOS\fR...]
+
+.SH DESCRIPCIÓN
+.B wlog
+es un wrapper que permite ejecutar cualquier script o programa, registrando 
+automáticamente información sobre su ejecución en formato JSON. Captura datos como
+tiempo de inicio, duración, resultado, exit code, argumentos de ejecución y opcionalmente
+la salida estándar.
+
+Toda la información se almacena en \fI/var/log/script_monitor.log\fR, lo que facilita
+el monitoreo detallado y análisis posterior de las ejecuciones.
+
+Adicionalmente, \fBwlog\fR detecta automáticamente el origen de la ejecución (shell, cron o systemd)
+y genera un ID de transacción único para cada ejecución.
+
+.B Manejo de interrupciones:
+A partir de la versión 1.0.1, wlog registra correctamente las interrupciones de ejecución
+(como Ctrl+C), asegurando que todas las ejecuciones queden registradas incluso si son
+terminadas abruptamente por el usuario.
+
+.B Captura de argumentos:
+A partir de la versión 1.0.2, wlog captura y registra los argumentos pasados al script
+ejecutado, así como el comando completo, proporcionando una visibilidad total sobre
+qué se ejecutó exactamente.
+
+.B Monitoreo de subprocesos:
+A partir de la versión 2.2.1, wlog puede monitorear los subprocesos directos (primer nivel)
+lanzados por el script principal cuando se especifica la opción \-f/\-\-follow. Cada subproceso
+detectado se registra en tiempo real con información detallada de PID, comando, estado y
+uso de recursos, utilizando el mismo ID de transacción para facilitar el seguimiento.
+
+.SH OPCIONES
+.TP
+.BR \-s ", " \-\-stdout
+Capturar la salida estándar (stdout) del script ejecutado.
+.TP
+.BR \-n ", " \-\-no\-stdout
+No capturar la salida estándar. Esta es la opción por defecto.
+.TP
+.BR \-f ", " \-\-follow
+Seguir y monitorear subprocesos directos (primer nivel) lanzados por el script principal.
+Ejecuta el script en un nuevo grupo de procesos y registra cada nuevo subproceso detectado
+en tiempo real con información de PID, comando, estado y uso de recursos.
+.TP
+.BR \-d ", " \-\-debug
+Habilitar modo de depuración. Crea logs detallados en \fI/tmp/wlog_debug.log\fR
+mostrando el flujo interno de ejecución y detección de subprocesos.
+.TP
+.BR \-h ", " \-\-help
+Mostrar el mensaje de ayuda y salir.
+
+.SH ARCHIVOS
+.TP
+.I /var/log/script_monitor.log
+Archivo donde se almacenan todos los registros de ejecución en formato JSON.
+.TP
+.I /tmp/wlog_debug.log
+Archivo de depuración creado cuando se usa la opción \-d/\-\-debug.
+
+.SH FORMATO DE LOGS
+\fBwlog\fR genera registros JSON para cada ejecución:
+
+.TP
+.B Registro de inicio:
+Contiene información sobre el inicio de la ejecución, incluyendo:
+.RS
+.IP \(bu 2
+timestamp: Fecha y hora de inicio
+.IP \(bu 2
+type: "start"
+.IP \(bu 2
+txid: ID único de transacción
+.IP \(bu 2
+host: Nombre del host
+.IP \(bu 2
+script: Ruta del script ejecutado
+.IP \(bu 2
+args: Argumentos pasados al script
+.IP \(bu 2
+command: Comando completo (script + argumentos)
+.IP \(bu 2
+user: Usuario que ejecutó el comando
+.IP \(bu 2
+origin: Origen de la ejecución (shell, cron, systemd)
+.IP \(bu 2
+capture_stdout: Si se captura la salida estándar (true/false)
+.IP \(bu 2
+follow_subprocesses: Si se monitorean subprocesos (true/false)
+.RE
+
+.TP
+.B Registro de subproceso detectado:
+Cuando se usa \-f/\-\-follow, se genera un registro por cada subproceso detectado:
+.RS
+.IP \(bu 2
+timestamp: Fecha y hora de detección del subproceso
+.IP \(bu 2
+type: "subprocess_detected"
+.IP \(bu 2
+txid: ID único de transacción (mismo que el proceso principal)
+.IP \(bu 2
+pid: PID del subproceso
+.IP \(bu 2
+parent_pid: PID del proceso padre
+.IP \(bu 2
+pgid: ID del grupo de procesos
+.IP \(bu 2
+command: Comando ejecutado por el subproceso
+.IP \(bu 2
+state: Estado del proceso (R, S, Z, etc.)
+.IP \(bu 2
+cpu: Uso de CPU en porcentaje
+.IP \(bu 2
+mem: Uso de memoria en porcentaje
+.RE
+
+.TP
+.B Registro de finalización:
+Contiene información sobre el resultado de la ejecución, incluyendo:
+.RS
+.IP \(bu 2
+timestamp: Fecha y hora de finalización
+.IP \(bu 2
+type: "end"
+.IP \(bu 2
+txid: ID único de transacción (mismo que el registro de inicio)
+.IP \(bu 2
+result: Resultado de la ejecución ("OK", "ERROR", o "INTERRUPTED")
+.IP \(bu 2
+exit_code: Código de salida del script
+.IP \(bu 2
+time: Tiempo de ejecución en segundos
+.IP \(bu 2
+stderr: Mensaje de error capturado (si lo hay)
+.IP \(bu 2
+stdout: Salida estándar capturada (sólo si se especificó \-s/\-\-stdout)
+.IP \(bu 2
+has_subprocesses: Si se detectaron subprocesos (true/false) - solo con \-f
+.IP \(bu 2
+subprocess_count: Número total de subprocesos detectados - solo con \-f
+.IP \(bu 2
+subprocess_pids: Lista de PIDs de subprocesos separados por comas - solo con \-f
+.IP \(bu 2
+active_subprocs: Número de subprocesos activos al finalizar - solo con \-f
+.IP \(bu 2
+subproc_cpu_usage: Uso total de CPU de subprocesos activos - solo con \-f
+.IP \(bu 2
+subproc_mem_usage: Uso total de memoria de subprocesos activos - solo con \-f
+.IP \(bu 2
+subproc_states: Estados de subprocesos activos - solo con \-f
+.RE
+
+.SH EJEMPLOS
+.TP
+.B wlog mi_script.sh
+Ejecuta mi_script.sh sin capturar stdout ni monitorear subprocesos.
+
+.TP
+.B wlog --stdout sleep 60
+Ejecuta el comando sleep durante 60 segundos capturando la salida estándar.
+Registra tanto el ejecutable (sleep) como el argumento (60).
+
+.TP
+.B wlog --follow mi_script.sh arg1 arg2
+Ejecuta mi_script.sh con argumentos monitoreando subprocesos directos.
+Registra cada nuevo subproceso detectado en tiempo real.
+
+.TP
+.B wlog -s -f -d python3 script.py --verbose
+Ejecuta el script Python con todas las opciones: captura de stdout,
+monitoreo de subprocesos y modo de depuración activado.
+
+.TP
+.B wlog -f ./deploy.sh production
+Ejecuta un script de despliegue monitoreando todos los subprocesos que lance
+(como rsync, ssh, docker, etc.) para obtener visibilidad completa del proceso.
+
+.SH SEÑALES
+wlog captura las siguientes señales para registrar correctamente las interrupciones:
+
+.TP
+.B SIGINT (Ctrl+C)
+Registra la interrupción con result="INTERRUPTED" y exit_code=130
+
+.TP
+.B SIGTERM
+Registra la interrupción con result="INTERRUPTED" y exit_code=143
+
+.TP
+.B SIGHUP
+Registra la interrupción con result="INTERRUPTED" y exit_code=1
+
+Cuando se usa \-f/\-\-follow, las interrupciones también terminan limpiamente
+todo el grupo de procesos creado.
+
+.SH NOTAS
+.TP
+.B Precisión del tiempo con \-f/\-\-follow
+Cuando se usa la opción de monitoreo de subprocesos, wlog ajusta automáticamente
+el tiempo de ejecución para no incluir el tiempo de espera interno del monitor,
+asegurando mediciones precisas del tiempo real de ejecución del script.
+
+.TP
+.B Detección de subprocesos
+El monitoreo se limita a subprocesos directos (primer nivel) para evitar
+ruido excesivo. Los subprocesos se detectan mediante consultas cada segundo
+al árbol de procesos.
+
+.TP
+.B Grupos de procesos
+Con \-f/\-\-follow, el script se ejecuta en un nuevo grupo de procesos usando
+setsid, lo que permite un control más preciso sobre todos los procesos relacionados.
+
+.SH AUTOR
+TEST <test@test.com>
+
+.SH REPORTANDO ERRORES
+Reporte errores o sugerencias en https://github.com/wlog/wlog
+
+.SH COPYRIGHT
+Copyright \(co 2025 TEST.
+Este programa está licenciado bajo GNU GPL versión 3.
+
